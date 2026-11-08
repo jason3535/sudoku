@@ -62,7 +62,77 @@
     x.used = x.used || [];
     return x;
   }
-  function save() { try { localStorage.setItem(KEY, JSON.stringify(D)); } catch (e) { /* 存不了也能玩 */ } }
+  // ⚠️ 不能直接用本页内存覆盖存储：多个标签页时，旧页面会把别的页面刚存的进度冲掉（2026-11-08 真丢过一次）。
+  // 所以：只有本页真的有改动才写；写之前先读存储里的最新版，合并后再写；每天留一份备份。
+  var dirty = false;
+  function readStored() { try { var x = JSON.parse(localStorage.getItem(KEY)); return x && x.v === 1 ? x : null; } catch (e) { return null; } }
+  function merge(a, b) {          // 把 b 合并进 a（a 为准），返回 a
+    if (!b) return a;
+    Object.keys(b.lv || {}).forEach(function (id) {
+      var A = a.lv[id] = a.lv[id] || {}, B = b.lv[id];
+      Object.keys(B).forEach(function (i) {
+        var x = A[i], y = B[i];
+        if (!x) { A[i] = y; return; }
+        var last = (y.last && x.last && y.last.at > x.last.at) ? y.last : x.last || y.last;
+        A[i] = { s: Math.max(x.s, y.s), t: Math.min(x.t, y.t), k: Math.max(x.k || 1, y.k || 1), last: last };
+      });
+    });
+    Object.keys(b.drills || {}).forEach(function (k) {
+      var x = a.drills[k], y = b.drills[k];
+      if (!x) { a.drills[k] = y; return; }
+      var seen = {}, hist = (x.hist || []).concat(y.hist || []).filter(function (h) { if (seen[h[0]]) return false; seen[h[0]] = 1; return true; })
+        .sort(function (p, q) { return p[0] - q[0]; }).slice(-30);
+      var bests = [x.best, y.best].filter(Boolean);
+      a.drills[k] = { sets: Math.max(x.sets || 0, y.sets || 0, hist.length), best: bests.length ? Math.min.apply(null, bests) : 0,
+        last: (y.last && x.last && y.last.at > x.last.at) ? y.last : x.last || y.last, mastered: !!(x.mastered || y.mastered), hist: hist };
+    });
+    var at = {}; a.comps.forEach(function (c) { at[c.at] = 1; });
+    (b.comps || []).forEach(function (c) { if (!at[c.at]) a.comps.push(c); });
+    a.comps.sort(function (p, q) { return p.at - q.at; });
+    Object.keys(b.days || {}).forEach(function (k) {
+      var x = a.days[k], y = b.days[k];
+      if (!x) { a.days[k] = y; return; }
+      ['ms', 'drill', 'lv', 'comp'].forEach(function (f) { x[f] = Math.max(x[f] || 0, y[f] || 0); });
+      if (y.ok) x.ok = 1;
+    });
+    (b.used || []).forEach(function (u) { if (a.used.indexOf(u) < 0) a.used.push(u); });
+    // 「做到一半」「进行中的比赛」「设置」不能取并集（做完的题会复活），按最后改动时间取新的
+    if ((b.curAt || 0) > (a.curAt || 0)) { a.cur = b.cur; a.curAt = b.curAt; }
+    if ((b.compAt || 0) > (a.compAt || 0)) { a.comp = b.comp; a.compAt = b.compAt; }
+    if (b.settings && (b.settings.at || 0) > (a.settings.at || 0)) a.settings = b.settings;
+    return a;
+  }
+  function backup(raw) {
+    try {
+      var k = KEY + '-bak-' + today();
+      if (raw && !localStorage.getItem(k)) {
+        localStorage.setItem(k, raw);
+        var old = Object.keys(localStorage).filter(function (x) { return x.indexOf(KEY + '-bak-') === 0; }).sort();
+        while (old.length > 7) localStorage.removeItem(old.shift());
+      }
+    } catch (e) { /* 备份失败不影响做题 */ }
+  }
+  function save(force) {
+    if (!dirty && !force) return;
+    try {
+      var raw = localStorage.getItem(KEY);
+      backup(raw);
+      var stored = readStored();
+      if (stored) merge(D, stored);
+      localStorage.setItem(KEY, JSON.stringify(D));
+      dirty = false;
+    } catch (e) { /* 存不了也能玩 */ }
+  }
+  function touch() { dirty = true; }
+  // 别的标签页存了新进度 → 合并进来
+  window.addEventListener('storage', function (e) {
+    if (e.key !== KEY || !e.newValue) return;
+    try {
+      var x = JSON.parse(e.newValue);
+      if (x && x.v === 1) { merge(D, x); if (!G) C = D.comp || null; if (screen !== 'game' && screen !== 'drill') render(); }
+    } catch (err) { /* 忽略 */ }
+  });
+  if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(function () {});
   function pad2(v) { return (v < 10 ? '0' : '') + v; }
   function dateKey(d) { return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()); }
   function today() { return dateKey(new Date()); }
@@ -294,13 +364,14 @@
   }
   function startLevel(id, idx) {
     if (D.cur && D.cur.level === id && D.cur.idx === idx && !D.cur.finished) { G = D.cur; }
-    else { G = newGame('lv', id, idx, puzzle(id, idx)); D.cur = G; }
+    else { G = newGame('lv', id, idx, puzzle(id, idx)); D.cur = G; D.curAt = Date.now(); }
     G.sel = -1; G.marks = null; G.msg = G.msg || '';
     save(); go('game');
   }
   function persist() {
-    if (G && G.kind === 'lv' && !G.finished) D.cur = G;
-    if (C) D.comp = C;
+    if (!dirty) return;
+    if (G && G.kind === 'lv' && !G.finished) { D.cur = G; D.curAt = Date.now(); }
+    if (C) { D.comp = C; D.compAt = Date.now(); }
     save();
   }
   function snapshot() { G.undo.push([G.board.slice(), G.notes.slice()]); if (G.undo.length > 200) G.undo.shift(); }
@@ -435,7 +506,7 @@
     var isBest = !old || G.ms < old.t;
     r[G.idx] = { s: Math.max(st, old ? old.s : 0), t: old ? Math.min(old.t, G.ms) : G.ms, k: (old ? old.k : 0) + 1,
       last: { s: st, t: G.ms, m: G.mistakes, h: G.hints, at: Date.now() } };
-    day().lv++; D.cur = null; markPlan(); save();
+    day().lv++; D.cur = null; D.curAt = Date.now(); markPlan(); dirty = true; save();
     var wasLocked = !wasPassed && passed(id) && !D.settings.unlockAll ? LEVELS.filter(function (l) { return l.after === id; }) : [];
     var unlockMsg = wasLocked.length ? '<p><b>解锁新关卡：' + wasLocked.map(function (l) { return l.name; }).join('、') + '！</b></p>' : '';
     var why = st === 3 ? '完美！' : st === 2 ? '想拿 ★★★：不用提示、不出错、' + LV[id].target + ' 分钟内。' : '想拿 ★★：最多 1 次提示、2 次错，' + LV[id].target * 2 + ' 分钟内。';
@@ -560,7 +631,7 @@
     D.drills[key] = { sets: old.sets + 1, best: ok.length >= DRILL_Q - 1 ? (old.best ? Math.min(old.best, avg) : avg) : old.best || 0,
       last: { ok: ok.length, avg: avg, at: Date.now() }, mastered: old.mastered || good,
       hist: (old.hist || []).concat([[Date.now(), ok.length, Math.round(avg)]]).slice(-30) };
-    day().drill++; markPlan(); save();
+    day().drill++; markPlan(); dirty = true; save();
     R.summary = { ok: ok.length, avg: avg, target: target, good: good, first: good && !old.mastered };
     go('drillResult');
   }
@@ -591,7 +662,7 @@
     C = { id: id, ms: 0, limit: c.limit * MIN, cur: -1, items: c.items.map(function (lid) {
       var idx = pickComp(lid), g = newGame('comp', lid, idx, puzzle(lid, idx)); return g;
     }) };
-    D.comp = C; save(); go('compSheet');
+    D.comp = C; D.compAt = Date.now(); dirty = true; save(); go('compSheet');
   }
   function compSheetView() {
     var c = CP[C.id], html = top('比赛：' + c.name, 'home', false);
@@ -615,7 +686,7 @@
     D.comps.push({ at: Date.now(), id: C.id, score: score, max: max, ms: Math.min(C.ms, C.limit), res: res });
     day().comp++; markPlan();
     C.result = { score: score, max: max, res: res, timeUp: !!timeUp };
-    var done = C; C = null; D.comp = null; save();
+    var done = C; C = null; D.comp = null; D.compAt = Date.now(); dirty = true; save();
     lastComp = done;
     go('compResult');
   }
@@ -774,6 +845,7 @@
     var el = ev.target.closest('[data-act]');
     if (!el || el.disabled) return;
     lastInput = Date.now();
+    dirty = true;
     tick();
     var a = el.getAttribute('data-act'), ds = el.dataset;
     switch (a) {
@@ -783,7 +855,7 @@
       case 'levelPage': persist(); if (G) curLevel = G.level; go('levelPage'); break;
       case 'play': startLevel(curLevel, +ds.i); break;
       case 'resume': curLevel = D.cur.level; startLevel(D.cur.level, D.cur.idx); break;
-      case 'replay': G = newGame('lv', G.level, G.idx, puzzle(G.level, G.idx)); D.cur = G; save(); go('game'); break;
+      case 'replay': G = newGame('lv', G.level, G.idx, puzzle(G.level, G.idx)); D.cur = G; D.curAt = Date.now(); save(); go('game'); break;
       case 'nextPuzzle': curLevel = G.level; startLevel(G.level, nextIdx(G.level)); break;
       case 'cell': tapCell(+ds.i); break;
       case 'digit': tapDigit(+ds.d); break;
@@ -823,9 +895,9 @@
         else { if (C) go('compSheet'); else startComp(it.id); }
         break;
       case 'stats': go('stats'); break;
-      case 'setTimer': D.settings.timer = !D.settings.timer; save(); render(); break;
-      case 'setAssist': D.settings.assist = ds.v; save(); render(); break;
-      case 'setUnlock': D.settings.unlockAll = !D.settings.unlockAll; save(); render(); break;
+      case 'setTimer': D.settings.timer = !D.settings.timer; D.settings.at = Date.now(); save(); render(); break;
+      case 'setAssist': D.settings.assist = ds.v; D.settings.at = Date.now(); save(); render(); break;
+      case 'setUnlock': D.settings.unlockAll = !D.settings.unlockAll; D.settings.at = Date.now(); save(); render(); break;
       case 'export':
         var t = document.getElementById('bk'); t.value = 'SDK1:' + btoa(unescape(encodeURIComponent(JSON.stringify(D)))); t.select(); break;
       case 'import':
